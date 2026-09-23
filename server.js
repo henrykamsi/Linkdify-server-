@@ -12,7 +12,8 @@ import { parseApkMeta } from 'apk-meta-parser';
 /* ============================================================
    FIREBASE INIT
    ============================================================ */
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+import fs from 'fs';
+const serviceAccount = JSON.parse(fs.readFileSync('firebase-key.json', 'utf8'));
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
