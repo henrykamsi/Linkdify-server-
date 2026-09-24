@@ -547,18 +547,21 @@ app.post('/api/ai/chat', async (req, res) => {
       .get();
     const apps = [];
     appsSnap.forEach(d => {
-      const a = d.data();
-      apps.push({
-  id: d.id,
-  name: a.name,
-  developer: a.developer || '',
-  category: a.category || '',
-  downloads: a.downloads || 0,
-  reviewCount: a.reviewCount || 0,
-  averageRating: a.averageRating || 0,
-  description: (a.description || '').substring(0, 200),
-  tags: a.tags || []
+  const a = d.data();
+  apps.push({
+    id: d.id,
+    name: a.name,
+    developer: a.developer || '',
+    category: a.category || '',
+    downloads: a.downloads || 0,
+    reviewCount: a.reviewCount || 0,
+    averageRating: a.averageRating || 0,
+    description: (a.description || '').substring(0, 200),
+    tags: a.tags || []
+  });
 });
+
+// Trending
     // Trending
     let trending = [];
     try {
@@ -651,7 +654,8 @@ for (const modelName of modelsToTry) {
 
 if (!gemData) {
   return res.status(503).json({ error: 'All Gemini models are busy. Please try again in a moment.' });
-       }
+}
+
     // New response format: steps[].content[].text
     let reply = '';
     if (gemData.steps && Array.isArray(gemData.steps)) {
