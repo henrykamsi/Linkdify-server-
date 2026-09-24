@@ -516,6 +516,205 @@ app.get('/api/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ---------- AI CHAT (Gemini) ---------- */
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    const { message, userId, history } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+
+    // Load Gemini key
+    const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
+    if (!cfgSnap.exists) return res.status(503).json({ error: 'AI not configured. Set admin_config/ai_settings.' });
+    const apiKey = cfgSnap.data().geminiApiKey;
+    if (!apiKey) return res.status(503).json({ error: 'No Gemini API key.' });
+
+    // Load store context
+    const appsSnap = await db.collection('live_apps')
+      .where('status', '==', 'approved')
+      .limit(100)
+      .get();
+    const apps = [];
+    appsSnap.forEach(d => {
+      const a = d.data();
+      apps.push({
+        id: d.id,
+        name: a.name,
+        developer: a.developer || '',
+        category: a.category || '',
+        downloads: a.downloads || 0,
+        reviewCount: a.reviewCount || 0,
+        description: (a.description || '').substring(0, 200),
+        tags: a.tags || []
+      });
+    });
+
+    // Trending
+    let trending = [];
+    try {
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const tSnap = await db.collection('install_events')
+        .where('event', '==', 'success')
+        .where('timestamp', '>', sevenDaysAgo)
+        .get();
+      const counts = {};
+      tSnap.forEach(d => {
+        const id = d.data().appId;
+        counts[id] = (counts[id] || 0) + 1;
+      });
+      trending = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([appId, count]) => {
+          const app = apps.find(a => a.id === appId);
+          return { appId, name: app ? app.name : appId, installs: count };
+        });
+    } catch(e) { /* ignore if no index */ }
+
+    // User activity
+    let userRecent = [];
+    let userWishlist = [];
+    if (userId) {
+      try {
+        const rSnap = await db.collection('user_recent')
+          .where('userId', '==', userId)
+          .limit(10)
+          .get();
+        rSnap.forEach(d => {
+          const appId = d.data().appId;
+          const app = apps.find(a => a.id === appId);
+          if (app) userRecent.push(app.name);
+        });
+        const wSnap = await db.collection('wishlists')
+          .where('userId', '==', userId)
+          .limit(10)
+          .get();
+        wSnap.forEach(d => {
+          const appId = d.data().appId;
+          const app = apps.find(a => a.id === appId);
+          if (app) userWishlist.push(app.name);
+        });
+      } catch(e) { /* ignore */ }
+    }
+
+    // Build prompt
+    const systemPrompt = `You are the HGT Store AI assistant. You help users find apps, understand what's trending, compare ratings, and answer questions about the store.
+
+STORE DATA:
+All Apps: ${JSON.stringify(apps)}
+Trending (last 7 days): ${JSON.stringify(trending)}
+${userId ? 'User recently viewed: ' + JSON.stringify(userRecent) : ''}
+${userId ? 'User wishlist: ' + JSON.stringify(userWishlist) : ''}
+
+RULES:
+- Be helpful, short, and friendly.
+- When the user asks about an app, look it up in the data and give real numbers.
+- If you recommend an app, mention its name, downloads, and rating.
+- You can respond in English, Pidgin, Yoruba, Hausa, or Igbo if the user writes in those.
+- Never make up apps that aren't in the data.
+- Keep replies under 150 words unless the user asks for detail.`;
+
+    // Build Gemini request
+    const contents = [];
+    if (Array.isArray(history)) {
+      history.slice(-6).forEach(h => {
+        contents.push({ role: h.role === 'user' ? 'user' : 'model', parts: [{ text: h.text }] });
+      });
+    }
+    contents.push({ role: 'user', parts: [{ text: message }] });
+
+    const gemRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: contents,
+          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+        })
+      }
+    );
+    const gemData = await gemRes.json();
+
+    if (!gemData.candidates || !gemData.candidates[0]) {
+      console.warn('Gemini response:', JSON.stringify(gemData));
+      return res.status(500).json({ error: 'Gemini returned no reply.', details: gemData.error?.message });
+    }
+
+    const reply = gemData.candidates[0].content.parts[0].text;
+
+    // Log
+    await db.collection('ai_chats').add({
+      userId: userId || 'anonymous',
+      userMessage: message,
+      aiReply: reply,
+      timestamp: new Date()
+    });
+
+    res.json({ reply });
+  } catch (e) {
+    console.error('AI chat error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- AI SEARCH SUMMARY ---------- */
+app.post('/api/ai/search-summary', async (req, res) => {
+  try {
+    const { query, matchingAppIds } = req.body;
+    if (!query) return res.status(400).json({ error: 'query required' });
+
+    const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
+    if (!cfgSnap.exists) return res.json({ summary: '' });
+    const apiKey = cfgSnap.data().geminiApiKey;
+    if (!apiKey) return res.json({ summary: '' });
+
+    const ids = Array.isArray(matchingAppIds) ? matchingAppIds.slice(0, 8) : [];
+    const apps = [];
+    for (const id of ids) {
+      const d = await db.collection('live_apps').doc(id).get();
+      if (d.exists) {
+        const a = d.data();
+        apps.push({
+          name: a.name,
+          developer: a.developer || '',
+          downloads: a.downloads || 0,
+          reviewCount: a.reviewCount || 0,
+          description: (a.description || '').substring(0, 150)
+        });
+      }
+    }
+
+    if (!apps.length) return res.json({ summary: '' });
+
+    const prompt = `User searched for: "${query}"
+
+Matching apps:
+${JSON.stringify(apps)}
+
+Write a 1-2 sentence summary recommending the best match. Mention the top app's name and its download count. Keep it under 40 words.`;
+
+    const gemRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.5, maxOutputTokens: 100 }
+        })
+      }
+    );
+    const gemData = await gemRes.json();
+    const summary = gemData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    res.json({ summary });
+  } catch (e) {
+    console.error('AI summary error:', e);
+    res.json({ summary: '' });
+  }
+});
+
 /* ============================================================
    SCHEDULED JOBS
    ============================================================ */
