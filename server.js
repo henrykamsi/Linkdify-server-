@@ -604,7 +604,12 @@ RULES:
 - Never make up apps that aren't in the data.
 - Keep replies under 150 words unless the user asks for detail.`;
 
-    // Use the NEW Interactions API
+// Try multiple models in case some are overloaded
+const modelsToTry = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
+let gemData = null;
+
+for (const modelName of modelsToTry) {
+  try {
     const gemRes = await fetch(
       'https://generativelanguage.googleapis.com/v1beta/interactions',
       {
@@ -614,15 +619,27 @@ RULES:
           'x-goog-api-key': apiKey
         },
         body: JSON.stringify({
-          model: 'gemini-3.8-flash',
-          system_instruction: systemPrompt,
-          input: message
+          model: modelName,
+          input: systemPrompt + '\n\nUSER: ' + message
         })
       }
     );
+    const tempData = await gemRes.json();
+    if (tempData.steps && Array.isArray(tempData.steps)) {
+      gemData = tempData;
+      console.log('AI replied using model:', modelName);
+      break;
+    } else if (tempData.error) {
+      console.warn('Model', modelName, 'failed:', tempData.error.message);
+    }
+  } catch(e) {
+    console.warn('Model', modelName, 'error:', e.message);
+  }
+}
 
-    const gemData = await gemRes.json();
-
+if (!gemData) {
+  return res.status(503).json({ error: 'All Gemini models are busy. Please try again in a moment.' });
+       }
     // New response format: steps[].content[].text
     let reply = '';
     if (gemData.steps && Array.isArray(gemData.steps)) {
