@@ -521,7 +521,22 @@ app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, userId, history } = req.body;
     if (!message) return res.status(400).json({ error: 'message required' });
+    if (!userId) return res.status(401).json({ error: 'Log in to chat with the AI.' });
 
+    // Daily limit check
+    const today = new Date().toISOString().split('T')[0];
+    const usageRef = db.collection('ai_usage').doc(userId + '_' + today);
+    const usageSnap = await usageRef.get();
+    const count = usageSnap.exists ? (usageSnap.data().count || 0) : 0;
+    const DAILY_LIMIT = 20;
+
+    if (count >= DAILY_LIMIT) {
+      return res.status(429).json({ error: 'You have used your 20 daily AI messages. Come back tomorrow.' });
+    }
+
+    await usageRef.set({
+      userId, date: today, count: count + 1, lastUsed: new Date()
+    }, { merge: true });
     // Load Gemini key
     const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
     if (!cfgSnap.exists) return res.status(503).json({ error: 'AI not configured. Set admin_config/ai_settings.' });
@@ -537,17 +552,16 @@ app.post('/api/ai/chat', async (req, res) => {
     appsSnap.forEach(d => {
       const a = d.data();
       apps.push({
-        id: d.id,
-        name: a.name,
-        developer: a.developer || '',
-        category: a.category || '',
-        downloads: a.downloads || 0,
-        reviewCount: a.reviewCount || 0,
-        description: (a.description || '').substring(0, 200),
-        tags: a.tags || []
-      });
-    });
-
+  id: d.id,
+  name: a.name,
+  developer: a.developer || '',
+  category: a.category || '',
+  downloads: a.downloads || 0,
+  reviewCount: a.reviewCount || 0,
+  averageRating: a.averageRating || 0,
+  description: (a.description || '').substring(0, 200),
+  tags: a.tags || []
+});
     // Trending
     let trending = [];
     try {
@@ -599,7 +613,8 @@ ${userId ? 'User wishlist: ' + JSON.stringify(userWishlist) : ''}
 RULES:
 - Be helpful, short, and friendly.
 - When the user asks about an app, look it up in the data and give real numbers.
-- If you recommend an app, mention its name, downloads, and rating.
+- If you recommend an app, mention its name, downloads, and its averageRating (star rating) if available.
+- When users ask about the best app, compare by averageRating first, then download count.
 - You can respond in English, Pidgin, Yoruba, Hausa, or Igbo.
 - Never make up apps that aren't in the data.
 - Keep replies under 150 words unless the user asks for detail.`;
@@ -667,6 +682,36 @@ if (!gemData) {
     res.json({ reply });
   } catch (e) {
     console.error('AI chat error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+/* ---------- AI USAGE CHECK ---------- */
+app.post('/api/ai/check-limit', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const today = new Date().toISOString().split('T')[0];
+    const docId = userId + '_' + today;
+    const ref = db.collection('ai_usage').doc(docId);
+    const snap = await ref.get();
+
+    const count = snap.exists ? (snap.data().count || 0) : 0;
+    const limit = 20;
+
+    if (count >= limit) {
+      return res.json({ allowed: false, used: count, limit, remaining: 0 });
+    }
+
+    await ref.set({
+      userId,
+      date: today,
+      count: count + 1,
+      lastUsed: new Date()
+    }, { merge: true });
+
+    res.json({ allowed: true, used: count + 1, limit, remaining: limit - count - 1 });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
