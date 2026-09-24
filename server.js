@@ -787,6 +787,144 @@ Write a 1-2 sentence summary recommending the best match. Mention the top app's 
   }
 });
 
+/* ---------- DIRECT APK FILE UPLOAD (multipart) ---------- */
+app.post('/api/upload-apk-file', uploadLimiter, async (req, res) => {
+  try {
+    // Use express.raw for binary body
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    await new Promise(resolve => req.on('end', resolve));
+    const fileBuffer = Buffer.concat(chunks);
+
+    if (!fileBuffer.length) return res.status(400).json({ error: 'No file received.' });
+
+    const fileSizeMB = fileBuffer.length / (1024 * 1024);
+    if (fileSizeMB > 500) return res.status(400).json({ error: 'File too large. Max 500 MB.' });
+
+    // Read developer / packageName from headers
+    const packageName = req.headers['x-package-name'] || '';
+    const fileName = req.headers['x-file-name'] || 'app.apk';
+    const developer = req.headers['x-developer'] || '';
+
+    // Get GitHub config
+    const cfg = await getGitHubConfig();
+    if (!cfg) return res.status(503).json({ error: 'No enabled GitHub storage available.' });
+
+    // Find or create release
+    const relRes = await fetch(
+      `https://api.github.com/repos/${cfg.user}/${cfg.repo}/releases/tags/${cfg.tag}`,
+      { headers: { Authorization: `Bearer ${cfg.token}`, 'User-Agent': 'HGT-Store' } }
+    );
+
+    let release;
+    if (relRes.status === 404) {
+      const createRes = await fetch(
+        `https://api.github.com/repos/${cfg.user}/${cfg.repo}/releases`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${cfg.token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'HGT-Store'
+          },
+          body: JSON.stringify({
+            tag_name: cfg.tag, target_commitish: 'main',
+            name: `APK Storage ${cfg.tag}`, draft: false, prerelease: false
+          })
+        }
+      );
+      release = await createRes.json();
+    } else {
+      release = await relRes.json();
+    }
+
+    if (!release.upload_url) return res.status(500).json({ error: 'GitHub release failed.' });
+
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '-');
+    const uploadUrl = release.upload_url.replace('{?name,label}', `?name=${encodeURIComponent(safeName)}`);
+
+    const uploadRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cfg.token}`,
+        'Content-Type': 'application/octet-stream',
+        'User-Agent': 'HGT-Store'
+      },
+      body: fileBuffer
+    });
+
+    const asset = await uploadRes.json();
+    if (!asset.browser_download_url) return res.status(500).json({ error: 'Upload failed.', details: asset });
+
+    await logActivity('apk-file-uploaded', `${fileName} (${fileSizeMB.toFixed(1)} MB)`, { ip: req.ip });
+
+    res.json({ success: true, downloadUrl: asset.browser_download_url, size: fileBuffer.length });
+  } catch (e) {
+    console.error('APK file upload error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- AI APP SUMMARY GENERATION ---------- */
+app.post('/api/ai/generate-app-summary', async (req, res) => {
+  try {
+    const { appId } = req.body;
+    if (!appId) return res.status(400).json({ error: 'appId required' });
+
+    const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
+    if (!cfgSnap.exists) return res.json({ summary: '' });
+    const apiKey = cfgSnap.data().geminiApiKey;
+    if (!apiKey) return res.json({ summary: '' });
+
+    const appDoc = await db.collection('live_apps').doc(appId).get();
+    if (!appDoc.exists) return res.status(404).json({ error: 'App not found' });
+    const a = appDoc.data();
+
+    const prompt = `Write a friendly 2-sentence summary for this app store listing. Be helpful and brief.
+
+App name: ${a.name}
+Category: ${a.category || 'general'}
+Developer: ${a.developer || 'unknown'}
+Description: ${a.description || 'No description'}
+
+Write 2 sentences a user would see on the app detail page. Keep under 40 words.`;
+
+    const modelsToTry = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-2.5-flash'];
+    let summary = '';
+    for (const modelName of modelsToTry) {
+      try {
+        const gemRes = await fetch(
+          'https://generativelanguage.googleapis.com/v1beta/interactions',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({ model: modelName, input: prompt })
+          }
+        );
+        const gemData = await gemRes.json();
+        if (gemData.steps && Array.isArray(gemData.steps)) {
+          for (const step of gemData.steps) {
+            if (step.type === 'model_output' && Array.isArray(step.content)) {
+              for (const c of step.content) {
+                if (c.type === 'text' && c.text) summary += c.text;
+              }
+            }
+          }
+          if (summary) break;
+        }
+      } catch(e) { console.warn('Summary model', modelName, 'error:', e.message); }
+    }
+
+    if (summary) {
+      await db.collection('live_apps').doc(appId).update({ aiSummary: summary });
+    }
+
+    res.json({ summary });
+  } catch (e) {
+    console.error('AI app summary error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /* ============================================================
    SCHEDULED JOBS
