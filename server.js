@@ -515,8 +515,6 @@ app.get('/api/stats', async (req, res) => {
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-/* ---------- AI CHAT (Gemini) ---------- */
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message, userId, history } = req.body;
@@ -529,14 +527,13 @@ app.post('/api/ai/chat', async (req, res) => {
     const usageSnap = await usageRef.get();
     const count = usageSnap.exists ? (usageSnap.data().count || 0) : 0;
     const DAILY_LIMIT = 20;
-
     if (count >= DAILY_LIMIT) {
       return res.status(429).json({ error: 'You have used your 20 daily AI messages. Come back tomorrow.' });
     }
-
     await usageRef.set({
       userId, date: today, count: count + 1, lastUsed: new Date()
     }, { merge: true });
+
     // Load Gemini key
     const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
     if (!cfgSnap.exists) return res.status(503).json({ error: 'AI not configured. Set admin_config/ai_settings.' });
