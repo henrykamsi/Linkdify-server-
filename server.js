@@ -568,35 +568,26 @@ app.post('/api/ai/chat', async (req, res) => {
           const app = apps.find(a => a.id === appId);
           return { appId, name: app ? app.name : appId, installs: count };
         });
-    } catch(e) { /* ignore if no index */ }
+    } catch(e) { /* ignore */ }
 
     // User activity
     let userRecent = [];
     let userWishlist = [];
     if (userId) {
       try {
-        const rSnap = await db.collection('user_recent')
-          .where('userId', '==', userId)
-          .limit(10)
-          .get();
+        const rSnap = await db.collection('user_recent').where('userId', '==', userId).limit(10).get();
         rSnap.forEach(d => {
-          const appId = d.data().appId;
-          const app = apps.find(a => a.id === appId);
+          const app = apps.find(a => a.id === d.data().appId);
           if (app) userRecent.push(app.name);
         });
-        const wSnap = await db.collection('wishlists')
-          .where('userId', '==', userId)
-          .limit(10)
-          .get();
+        const wSnap = await db.collection('wishlists').where('userId', '==', userId).limit(10).get();
         wSnap.forEach(d => {
-          const appId = d.data().appId;
-          const app = apps.find(a => a.id === appId);
+          const app = apps.find(a => a.id === d.data().appId);
           if (app) userWishlist.push(app.name);
         });
       } catch(e) { /* ignore */ }
     }
 
-    // Build prompt
     const systemPrompt = `You are the HGT Store AI assistant. You help users find apps, understand what's trending, compare ratings, and answer questions about the store.
 
 STORE DATA:
@@ -609,41 +600,46 @@ RULES:
 - Be helpful, short, and friendly.
 - When the user asks about an app, look it up in the data and give real numbers.
 - If you recommend an app, mention its name, downloads, and rating.
-- You can respond in English, Pidgin, Yoruba, Hausa, or Igbo if the user writes in those.
+- You can respond in English, Pidgin, Yoruba, Hausa, or Igbo.
 - Never make up apps that aren't in the data.
 - Keep replies under 150 words unless the user asks for detail.`;
 
-    // Build Gemini request
-    const contents = [];
-    if (Array.isArray(history)) {
-      history.slice(-6).forEach(h => {
-        contents.push({ role: h.role === 'user' ? 'user' : 'model', parts: [{ text: h.text }] });
-      });
-    }
-    contents.push({ role: 'user', parts: [{ text: message }] });
-
+    // Use the NEW Interactions API
     const gemRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      'https://generativelanguage.googleapis.com/v1beta/interactions',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
         body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: contents,
-          generationConfig: { temperature: 0.7, maxOutputTokens: 500 }
+          model: 'gemini-3.8-flash',
+          system_instruction: systemPrompt,
+          input: message
         })
       }
     );
+
     const gemData = await gemRes.json();
 
-    if (!gemData.candidates || !gemData.candidates[0]) {
-      console.warn('Gemini response:', JSON.stringify(gemData));
-      return res.status(500).json({ error: 'Gemini returned no reply.', details: gemData.error?.message });
+    // New response format: steps[].content[].text
+    let reply = '';
+    if (gemData.steps && Array.isArray(gemData.steps)) {
+      for (const step of gemData.steps) {
+        if (step.type === 'model_output' && Array.isArray(step.content)) {
+          for (const c of step.content) {
+            if (c.type === 'text' && c.text) reply += c.text;
+          }
+        }
+      }
     }
 
-    const reply = gemData.candidates[0].content.parts[0].text;
+    if (!reply) {
+      console.warn('Gemini response:', JSON.stringify(gemData));
+      return res.status(500).json({ error: 'Gemini returned no reply.', details: gemData.error?.message || 'unknown' });
+    }
 
-    // Log
     await db.collection('ai_chats').add({
       userId: userId || 'anonymous',
       userMessage: message,
@@ -663,6 +659,70 @@ app.post('/api/ai/search-summary', async (req, res) => {
   try {
     const { query, matchingAppIds } = req.body;
     if (!query) return res.status(400).json({ error: 'query required' });
+
+    const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
+    if (!cfgSnap.exists) return res.json({ summary: '' });
+    const apiKey = cfgSnap.data().geminiApiKey;
+    if (!apiKey) return res.json({ summary: '' });
+
+    const ids = Array.isArray(matchingAppIds) ? matchingAppIds.slice(0, 8) : [];
+    const apps = [];
+    for (const id of ids) {
+      const d = await db.collection('live_apps').doc(id).get();
+      if (d.exists) {
+        const a = d.data();
+        apps.push({
+          name: a.name,
+          developer: a.developer || '',
+          downloads: a.downloads || 0,
+          reviewCount: a.reviewCount || 0,
+          description: (a.description || '').substring(0, 150)
+        });
+      }
+    }
+
+    if (!apps.length) return res.json({ summary: '' });
+
+    const prompt = `User searched for: "${query}"
+
+Matching apps:
+${JSON.stringify(apps)}
+
+Write a 1-2 sentence summary recommending the best match. Mention the top app's name and its download count. Keep it under 40 words.`;
+
+    const gemRes = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/interactions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify({
+          model: 'gemini-3.8-flash',
+          input: prompt
+        })
+      }
+    );
+    const gemData = await gemRes.json();
+
+    let summary = '';
+    if (gemData.steps && Array.isArray(gemData.steps)) {
+      for (const step of gemData.steps) {
+        if (step.type === 'model_output' && Array.isArray(step.content)) {
+          for (const c of step.content) {
+            if (c.type === 'text' && c.text) summary += c.text;
+          }
+        }
+      }
+    }
+
+    res.json({ summary });
+  } catch (e) {
+    console.error('AI summary error:', e);
+    res.json({ summary: '' });
+  }
+});
 
     const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
     if (!cfgSnap.exists) return res.json({ summary: '' });
