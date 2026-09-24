@@ -724,56 +724,6 @@ Write a 1-2 sentence summary recommending the best match. Mention the top app's 
   }
 });
 
-    const cfgSnap = await db.collection('admin_config').doc('ai_settings').get();
-    if (!cfgSnap.exists) return res.json({ summary: '' });
-    const apiKey = cfgSnap.data().geminiApiKey;
-    if (!apiKey) return res.json({ summary: '' });
-
-    const ids = Array.isArray(matchingAppIds) ? matchingAppIds.slice(0, 8) : [];
-    const apps = [];
-    for (const id of ids) {
-      const d = await db.collection('live_apps').doc(id).get();
-      if (d.exists) {
-        const a = d.data();
-        apps.push({
-          name: a.name,
-          developer: a.developer || '',
-          downloads: a.downloads || 0,
-          reviewCount: a.reviewCount || 0,
-          description: (a.description || '').substring(0, 150)
-        });
-      }
-    }
-
-    if (!apps.length) return res.json({ summary: '' });
-
-    const prompt = `User searched for: "${query}"
-
-Matching apps:
-${JSON.stringify(apps)}
-
-Write a 1-2 sentence summary recommending the best match. Mention the top app's name and its download count. Keep it under 40 words.`;
-
-    const gemRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.5, maxOutputTokens: 100 }
-        })
-      }
-    );
-    const gemData = await gemRes.json();
-    const summary = gemData.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-    res.json({ summary });
-  } catch (e) {
-    console.error('AI summary error:', e);
-    res.json({ summary: '' });
-  }
-});
 
 /* ============================================================
    SCHEDULED JOBS
