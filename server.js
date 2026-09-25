@@ -22,7 +22,7 @@ const db = admin.firestore();
    ============================================================ */
 const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: '*', allowedHeaders: ['Content-Type', 'X-Developer', 'X-Package-Name', 'X-File-Name'] }));
 app.use(express.json({ limit: '500mb' }));
 app.set('trust proxy', 1);
 
@@ -40,7 +40,7 @@ const generalLimiter = rateLimit({
 const uploadLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 5,
-  keyGenerator: (req) => req.body?.developer || req.ip,
+  keyGenerator: (req) => req.headers['x-developer'] || req.ip,
   message: { error: 'Upload limit reached. Max 5 per day per developer.' }
 });
 
